@@ -183,7 +183,7 @@ def multi_tensor_adam_param_remainder_fl(
         # Compute remainder: difference between FP32 master and BF16 representation
         # Scale and quantize to int16 range
         remainder_fp32 = flag_gems.mul(flag_gems.sub(param_master, param_bf16.float()), 2.0 ** 16)
-        remainder_int16 = flag_gems.clamp(flag_gems.round(remainder_fp32), -32768, 32767).to(dtype=torch.int16)
+        remainder_int16 = flag_gems.clamp(torch.round(remainder_fp32), -32768, 32767).to(dtype=torch.int16)
 
         # Write back
         flag_gems.copy_(p, param_bf16)
