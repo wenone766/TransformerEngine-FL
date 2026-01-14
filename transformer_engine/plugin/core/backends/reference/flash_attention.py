@@ -7,8 +7,76 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from transformer_engine.plugin.core.ops import FlashAttentionBase
+
+
+def _all_gather_along_seq(
+    tensor: torch.Tensor,
+    cp_group: Any,
+    seq_dim: int = 2,
+) -> torch.Tensor:
+    """All-gather tensor along sequence dimension across CP group."""
+    world_size = dist.get_world_size(cp_group)
+    if world_size == 1:
+        return tensor
+
+    # Ensure tensor is contiguous before all_gather
+    tensor = tensor.contiguous()
+
+    # Use autograd-compatible all_gather
+    gathered_list = [torch.empty_like(tensor) for _ in range(world_size)]
+
+    # Wrap in a custom autograd function to handle backward pass
+    class AllGatherFunc(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, input_tensor):
+            dist.all_gather(gathered_list, input_tensor, group=cp_group)
+            ctx.cp_group = cp_group
+            ctx.world_size = world_size
+            return torch.cat(gathered_list, dim=seq_dim)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            # In backward, we need to reduce_scatter the gradients
+            # Split the gradient and take only the local chunk
+            grad_chunks = torch.chunk(grad_output, ctx.world_size, dim=seq_dim)
+
+            # Reduce scatter: sum gradients from all ranks and scatter
+            local_grad = torch.zeros_like(grad_chunks[0])
+            grad_list = [torch.empty_like(grad_chunks[0]) for _ in range(ctx.world_size)]
+            for i, chunk in enumerate(grad_chunks):
+                grad_list[i].copy_(chunk)
+
+            dist.reduce_scatter(local_grad, grad_list, group=ctx.cp_group)
+            return local_grad
+
+    return AllGatherFunc.apply(tensor)
+
+
+def _reduce_scatter_along_seq(
+    tensor: torch.Tensor,
+    cp_group: Any,
+    seq_dim: int = 2,
+) -> torch.Tensor:
+    """Reduce-scatter tensor along sequence dimension across CP group."""
+    world_size = dist.get_world_size(cp_group)
+    if world_size == 1:
+        return tensor
+
+    # Ensure tensor is contiguous before reduce_scatter
+    tensor = tensor.contiguous()
+    seq_len = tensor.shape[seq_dim]
+    chunk_size = seq_len // world_size
+
+    output = torch.empty(
+        *tensor.shape[:seq_dim], chunk_size, *tensor.shape[seq_dim + 1:],
+        dtype=tensor.dtype, device=tensor.device
+    )
+
+    dist.reduce_scatter_tensor(output, tensor, group=cp_group)
+    return output
 
 
 class FlashAttentionTorch(FlashAttentionBase):
@@ -151,9 +219,11 @@ class FlashAttentionTorch(FlashAttentionBase):
 
         padding_mask = torch.ones(batch_size, max_seqlen, dtype=torch.bool, device=device)
 
+        # Vectorized unpacking - avoid Python loop and .item() calls
+        cu_seqlens_cpu = cu_seqlens.cpu()
         for i in range(batch_size):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
+            start = cu_seqlens_cpu[i].item()
+            end = cu_seqlens_cpu[i + 1].item()
             seq_len = end - start
 
             seq_data = tensor[start:end].permute(1, 0, 2)
@@ -179,9 +249,11 @@ class FlashAttentionTorch(FlashAttentionBase):
             dtype=tensor.dtype, device=device
         )
 
+        # Vectorized packing - avoid repeated .item() calls
+        cu_seqlens_cpu = cu_seqlens.cpu()
         for i in range(batch_size):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
+            start = cu_seqlens_cpu[i].item()
+            end = cu_seqlens_cpu[i + 1].item()
             seq_len = end - start
 
             seq_data = tensor[i, :, :seq_len, :].permute(1, 0, 2)
@@ -214,23 +286,29 @@ class FlashAttentionTorch(FlashAttentionBase):
         flash_attention_backend: Optional[Any] = None,
         fp8_output: bool = False,
     ) -> torch.Tensor:
-        """Flash Attention implementation using PyTorch's scaled_dot_product_attention."""
+        """Flash Attention implementation using PyTorch's scaled_dot_product_attention.
+
+        Supports Context Parallelism (CP) by all-gathering key/value across the CP group.
+        """
         if fp8:
             raise NotImplementedError("FP8 is not supported in PyTorch SDPA backend")
-        if cp_group is not None:
-            raise NotImplementedError("Context parallelism is not supported in PyTorch SDPA backend")
+
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes are not supported in PyTorch SDPA backend")
 
         query_original_shape = query_layer.shape
+        use_cp = cp_group is not None
 
-        # Check if input is in standard 4D format - same as flagos backend
-        # If tensor is 4D, treat it as standard format and just do layout conversion
-        # Only use unpack logic for true packed format (3D tensors with thd layout)
+        if use_cp:
+            cp_size = dist.get_world_size(cp_group)
+            cp_rank = dist.get_rank(cp_group)
+        else:
+            cp_size = 1
+            cp_rank = 0
+
         is_standard_4d = query_layer.dim() == 4
 
         if is_standard_4d:
-            # Standard 4D tensor format - just convert layout like flagos does
             query = self._convert_layout_to_bhsd(query_layer, qkv_layout)
             key = self._convert_layout_to_bhsd(key_layer, qkv_layout)
             value = self._convert_layout_to_bhsd(value_layer, qkv_layout)
@@ -238,7 +316,6 @@ class FlashAttentionTorch(FlashAttentionBase):
             padding_mask_q = None
             padding_mask_kv = None
         else:
-            # True packed format (thd layout, 3D tensor) - use unpack logic
             use_packed_format = cu_seqlens_q is not None or cu_seqlens_kv is not None
             padding_mask_q = None
             padding_mask_kv = None
@@ -261,6 +338,15 @@ class FlashAttentionTorch(FlashAttentionBase):
                 value = self._convert_layout_to_bhsd(value_layer, qkv_layout)
 
         batch_size, num_heads_q, seq_len_q, head_dim = query.shape
+        local_seq_len_q = seq_len_q
+
+        if use_cp:
+            # Ensure tensors are contiguous before all_gather operations
+            key = key.contiguous()
+            value = value.contiguous()
+            key = _all_gather_along_seq(key, cp_group, seq_dim=2)
+            value = _all_gather_along_seq(value, cp_group, seq_dim=2)
+
         num_heads_kv = key.shape[1]
         seq_len_kv = key.shape[2]
 
@@ -285,7 +371,22 @@ class FlashAttentionTorch(FlashAttentionBase):
             attn_mask.masked_fill_(padding_broadcast, float('-inf'))
 
         if attn_mask_type == "causal":
-            if window_size is None and not use_packed_format:
+            if use_cp:
+                # Vectorized causal mask creation for CP
+                q_start = cp_rank * local_seq_len_q
+                q_indices = torch.arange(local_seq_len_q, device=query.device, dtype=torch.long).unsqueeze(1) + q_start
+                kv_indices = torch.arange(seq_len_kv, device=query.device, dtype=torch.long).unsqueeze(0)
+                causal_mask = torch.zeros(local_seq_len_q, seq_len_kv, dtype=query.dtype, device=query.device)
+                causal_mask.masked_fill_(kv_indices > q_indices, float('-inf'))
+
+                if attn_mask is not None:
+                    if attn_mask.dim() == 2:
+                        attn_mask = attn_mask + causal_mask
+                    else:
+                        attn_mask = attn_mask + causal_mask.unsqueeze(0)
+                else:
+                    attn_mask = causal_mask
+            elif window_size is None and not use_packed_format:
                 is_causal = True
             else:
                 causal_mask = torch.zeros(
@@ -306,16 +407,29 @@ class FlashAttentionTorch(FlashAttentionBase):
                     attn_mask = causal_mask
 
         if window_size is not None and not is_causal:
-            window_mask = self._create_sliding_window_mask(
-                seq_len_q=seq_len_q,
-                seq_len_kv=seq_len_kv,
-                window_size=window_size,
-                device=query.device,
-                dtype=query.dtype,
-            )
+            if use_cp:
+                # Vectorized window mask creation for CP
+                left_window, right_window = window_size
+                q_start = cp_rank * local_seq_len_q
+                q_indices = torch.arange(local_seq_len_q, device=query.device, dtype=torch.long).unsqueeze(1) + q_start
+                kv_indices = torch.arange(seq_len_kv, device=query.device, dtype=torch.long).unsqueeze(0)
+
+                window_mask = torch.zeros(local_seq_len_q, seq_len_kv, dtype=query.dtype, device=query.device)
+                if left_window >= 0:
+                    window_mask.masked_fill_(kv_indices < q_indices - left_window, float('-inf'))
+                if right_window >= 0:
+                    window_mask.masked_fill_(kv_indices > q_indices + right_window, float('-inf'))
+            else:
+                window_mask = self._create_sliding_window_mask(
+                    seq_len_q=seq_len_q,
+                    seq_len_kv=seq_len_kv,
+                    window_size=window_size,
+                    device=query.device,
+                    dtype=query.dtype,
+                )
 
             if attn_mask is not None:
-                attn_mask = attn_mask + window_mask.unsqueeze(0)
+                attn_mask = attn_mask + window_mask.unsqueeze(0) if window_mask.dim() == 2 else attn_mask + window_mask
             else:
                 attn_mask = window_mask
 
@@ -375,8 +489,6 @@ class FlashAttentionTorch(FlashAttentionBase):
                 output = output.contiguous().view(total_tokens, 1, hidden_size)
         else:
             output = self._convert_bhsd_to_layout(output, qkv_layout)
-            # Flatten the last two dimensions (heads, dim) -> (heads * dim)
-            # to match the output format of other backends
             output = output.contiguous().view(*output.shape[:-2], -1)
 
         return output
